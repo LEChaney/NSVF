@@ -1,4 +1,5 @@
 *.pyc
+*.pyd
 *.so
 *.pkl
 .DS_Store/
@@ -15,3 +16,5 @@ images/
 tools/
 fb_sweep/
 fb_scripts/
+datasets/
+checkpoint/
