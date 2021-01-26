@@ -394,7 +394,7 @@ class ShapeViewStreamDataset(BaseWrapperDataset):
         return len(self.dataset.data_index)
 
     def ordered_indices(self):
-        return np.arange(len(self))
+        return np.arange(len(self), dtype=np.int64)
 
     @property
     def cache(self):
@@ -543,7 +543,7 @@ class InfiniteDataset(BaseWrapperDataset):
         return self.MAXLEN
 
     def ordered_indices(self):
-        return np.arange(self.MAXLEN)
+        return np.arange(self.MAXLEN, dtype=np.int64)
 
     def __getitem__(self, index):
         actual_length = len(self.dataset)
