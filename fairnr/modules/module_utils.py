@@ -93,6 +93,66 @@ class NeRFPosEmbLinear(nn.Module):
             outstr = 'Cat({}, {})'.format(outstr, self.in_dim)
         return outstr
 
+class GroupDense(nn.Module):
+    def __init__(self, in_dim, out_dim, groups=2):
+        super().__init__()
+        self.groups = groups
+
+        assert (in_dim % groups == 0) and (out_dim % groups == 0)
+        self.ch_per_in_group = in_dim // groups
+        self.ch_per_out_group = out_dim // groups
+
+        self.group_nets = nn.ModuleList([nn.Linear(self.ch_per_in_group, self.ch_per_out_group) for g in range(groups)])
+
+        self.streams = [torch.cuda.Stream() for g in range(groups)]
+    
+    def forward(self, x):
+        # Perform grouped nn.Linear ops
+        for g in range(self.groups):
+            with torch.cuda.stream(self.streams[g]):
+                g_start = g * self.ch_per_in_group
+                g_end = g_start + self.ch_per_in_group
+
+                if g == 0:
+                    y =  [self.group_nets[g](x[:, g_start:g_end])]
+                else:
+                    y += [self.group_nets[g](x[:, g_start:g_end])]
+        torch.cuda.synchronize()
+
+        # Concat results to [N, out_C]
+        return torch.cat(y, -1)
+
+
+class ChannelShuffle(nn.Module):
+    def __init__(self, groups):
+        super().__init__()
+        self.groups = groups
+
+    def forward(self, x):
+        batchsize, num_channels = x.data.size()
+        assert num_channels % self.groups == 0
+        group_channels = num_channels // self.groups
+        
+        x = x.reshape(batchsize, group_channels, self.groups)
+        x = x.permute(0, 2, 1)
+        x = x.reshape(batchsize, num_channels)
+
+        return x
+
+class ShuffleNetLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, with_ln=True, groups=2, with_act=True):
+        super().__init__()
+        self.net = [GroupDense(in_dim, out_dim, groups=groups)]
+        if with_ln:
+            self.net += [nn.LayerNorm([out_dim])]
+        if with_act:
+            self.net += [nn.ReLU()]
+        self.net += [ChannelShuffle(groups)]
+        self.net = nn.Sequential(*self.net)
+
+    def forward(self, x):
+        return self.net(x)
+
 
 class FCLayer(nn.Module):
     """

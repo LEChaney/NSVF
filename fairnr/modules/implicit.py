@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from fairseq.utils import get_activation_fn
 from fairnr.modules.hyper import HyperFC
-from fairnr.modules.module_utils import FCLayer
+from fairnr.modules.module_utils import FCLayer, ShuffleNetLayer
 
 
 class BackgroundField(nn.Module):
@@ -41,7 +41,8 @@ class BackgroundField(nn.Module):
 
 class ImplicitField(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim, num_layers, 
-                outmost_linear=False, with_ln=True, skips=None, spec_init=True):
+                outmost_linear=False, with_ln=True, skips=None, spec_init=True,
+                use_shuffle_net=False, shuffle_net_groups=8):
         super().__init__()
         self.skips = skips
         self.net = []
@@ -51,6 +52,8 @@ class ImplicitField(nn.Module):
             next_dim = out_dim if i == (num_layers - 1) else hidden_dim
             if (i == (num_layers - 1)) and outmost_linear:
                 self.net.append(nn.Linear(prev_dim, next_dim))
+            elif use_shuffle_net:
+                self.net.append(ShuffleNetLayer(prev_dim, next_dim, with_ln=with_ln, groups=shuffle_net_groups))
             else:
                 self.net.append(FCLayer(prev_dim, next_dim, with_ln=with_ln))
             prev_dim = next_dim
@@ -103,9 +106,11 @@ class HyperImplicitField(nn.Module):
 class SignedDistanceField(ImplicitField):
     """
     Predictor for density or SDF values.
+    Note: use_shuffle_net parameter only applies when recurrent is set to false
     """
     def __init__(self, in_dim, hidden_dim, num_layers=1, 
-                recurrent=False, with_ln=True, spec_init=True):
+                recurrent=False, with_ln=True, spec_init=True,
+                use_shuffle_net=False, shuffle_net_groups=8):
         super().__init__(in_dim, in_dim, in_dim, num_layers-1, with_ln=with_ln, spec_init=spec_init)
         self.recurrent = recurrent
         if recurrent:
@@ -113,6 +118,9 @@ class SignedDistanceField(ImplicitField):
             self.hidden_layer = nn.LSTMCell(input_size=in_dim, hidden_size=hidden_dim)
             self.hidden_layer.apply(init_recurrent_weights)
             lstm_forget_gate_init(self.hidden_layer)
+        elif use_shuffle_net:
+            self.hidden_layer = ShuffleNetLayer(in_dim, hidden_dim, with_ln, groups=shuffle_net_groups) \
+                if num_layers > 0 else nn.Identity()
         else:
             self.hidden_layer = FCLayer(in_dim, hidden_dim, with_ln) \
                 if num_layers > 0 else nn.Identity()
