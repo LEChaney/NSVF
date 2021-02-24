@@ -7,6 +7,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
+from torch.nn.parameter import Parameter
 
 from fairseq.modules import LayerNorm
 from fairseq.utils import get_activation_fn
@@ -93,34 +95,51 @@ class NeRFPosEmbLinear(nn.Module):
             outstr = 'Cat({}, {})'.format(outstr, self.in_dim)
         return outstr
 
+
 class GroupDense(nn.Module):
-    def __init__(self, in_dim, out_dim, groups=2):
+    def __init__(self, in_dim, out_dim, groups=2, bias=True):
         super().__init__()
         self.groups = groups
+        self.in_dim = in_dim
+        self.out_dim = out_dim
 
         assert (in_dim % groups == 0) and (out_dim % groups == 0)
         self.ch_per_in_group = in_dim // groups
         self.ch_per_out_group = out_dim // groups
 
-        self.group_nets = nn.ModuleList([nn.Linear(self.ch_per_in_group, self.ch_per_out_group) for g in range(groups)])
+        # TODO: Remove rand initialization
+        self.weight = Parameter(torch.rand(groups, self.ch_per_in_group, self.ch_per_out_group))
+        if bias:
+            self.bias = Parameter(torch.rand(out_dim))
+        else:
+            self.register_parameter('bias', None)
 
-        self.streams = [torch.cuda.Stream() for g in range(groups)]
+        # TODO: Add proper weight initialization
+        # self.reset_parameters()
+
+    # def reset_parameters(self):
+    #     init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    #     if self.bias is not None:
+    #         fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+    #         bound = 1 / math.sqrt(fan_in)
+    #         init.uniform_(self.bias, -bound, bound)
     
     def forward(self, x):
-        # Perform grouped nn.Linear ops
-        for g in range(self.groups):
-            with torch.cuda.stream(self.streams[g]):
-                g_start = g * self.ch_per_in_group
-                g_end = g_start + self.ch_per_in_group
+        # Reshape for batch matmul
+        N = x.size(0)
+        x = x.view(N, self.groups, self.ch_per_in_group)
 
-                if g == 0:
-                    y =  [self.group_nets[g](x[:, g_start:g_end])]
-                else:
-                    y += [self.group_nets[g](x[:, g_start:g_end])]
-        torch.cuda.synchronize()
+        # Perform fused op
+        output = torch.einsum('bgi,gij->bgj', x, self.weight) # NOTE: Only einsum implementation seems to have optimized backprop memory consumption
 
-        # Concat results to [N, out_C]
-        return torch.cat(y, -1)
+        # Reshape back to [N, C_out]
+        output = output.reshape(N, self.out_dim)
+
+        # Add bias
+        if self.bias is not None:
+            output += self.bias
+
+        return output
 
 
 class ChannelShuffle(nn.Module):
