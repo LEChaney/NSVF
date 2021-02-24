@@ -16,6 +16,7 @@ import sys
 
 import numpy as np
 import torch
+import pandas as pd
 
 from fairseq import checkpoint_utils, distributed_utils, options, tasks, utils
 from fairseq.data import iterators
@@ -24,6 +25,8 @@ from fairseq.trainer import Trainer
 from fairseq.model_parallel.megatron_trainer import MegatronTrainer
 
 from fairnr import ResetTrainerException
+
+from memory_log.plot import plot_mem, pprint_mem
 
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -200,6 +203,17 @@ def train(args, trainer, task, epoch_itr):
             # reset mid-epoch stats after each log interval
             # the end-of-epoch stats will still be preserved
             metrics.reset_meters('train_inner')
+
+        # Log memory usage stats
+        if getattr(args, "debug_memory_usage", False):
+            model = trainer.get_model()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            df = pd.DataFrame(model.mem_log)
+            plot_mem(df, output_file=os.path.join(args.save_dir, "memory_plot.png"))
+            pprint_mem(df, exp=args.arch)
+
 
         valid_losses = validate_and_save(args, trainer, task, epoch_itr, valid_subsets)
         if should_stop_early(args, valid_losses[0]) or num_updates >= max_update:

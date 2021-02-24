@@ -30,6 +30,8 @@ from fairnr.modules.reader import get_reader
 from fairnr.data.geometry import ray, compute_normal_map
 from fairnr.data.data_utils import recover_image
 
+from memory_log.memory import add_memory_hooks
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +60,14 @@ class BaseModel(BaseFairseqModel):
         else:
             self.field_fine = None
 
+        self.mem_log = []
+        self.mem_hooks = []
+        if getattr(self.args, "debug_memory_usage", False):
+            # Add memory hooks for memory debugging
+            for idx, module in enumerate(self.modules()):
+                add_memory_hooks(idx, module, self.mem_log, exp=args.arch, hr=self.mem_hooks)
+            
+
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
@@ -85,6 +95,8 @@ class BaseModel(BaseFairseqModel):
             help='if set, a second ray marching pass will be performed based on the first time probs.')
         parser.add_argument('--use-fine-model', action='store_true', 
             help='if set, we will simultaneously optimize two networks, a coarse field and a fine field.')
+        parser.add_argument('--debug-memory-usage', action='store_true',
+            help='if set, detailed memory usage will be output for each stage of the network')
     
     def set_num_updates(self, num_updates):
         self._num_updates = num_updates
