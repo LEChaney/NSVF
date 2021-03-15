@@ -58,6 +58,7 @@ class VolumeRenderer(Renderer):
         self.discrete_reg = getattr(args, "discrete_regularization", False)
         self.raymarching_tolerance = getattr(args, "raymarching_tolerance", 0.0)
         self.trace_normal = getattr(args, "trace_normal", False)
+        self.acum_latent = getattr(args, "acum_latent", False)
 
     @staticmethod
     def add_args(parser):
@@ -73,6 +74,17 @@ class VolumeRenderer(Renderer):
         parser.add_argument('--raymarching-tolerance', type=float, default=0)
 
         parser.add_argument('--trace-normal', action='store_true')
+
+        parser.add_argument('--acum-latent', action='store_true',
+                            help='accumulate in latent instead of color space for texture decoding')
+
+
+    def calc_hit_probs(self, sampled_depth, free_energy):
+        shifted_free_energy = torch.cat([free_energy.new_zeros(sampled_depth.size(0), 1), free_energy[:, :-1]], dim=-1)  # shift one step
+        a = 1 - torch.exp(-free_energy.float())                             # probability of it is not empty here
+        b = torch.exp(-torch.cumsum(shifted_free_energy.float(), dim=-1))   # probability of everything is empty up to now
+        probs = (a * b).type_as(free_energy)                                # probability of the ray hits something here
+        return probs
 
     def forward_once(
         self, input_fn, field_fn, ray_start, ray_dir, samples, encoder_states, 
@@ -97,14 +109,10 @@ class VolumeRenderer(Renderer):
         samples['sampled_point_ray_direction'] = sampled_dir
     
         # apply mask    
-        samples = {name: s[sample_mask] for name, s in samples.items()}
+        masked_samples = {name: s[sample_mask] for name, s in samples.items()}
        
         # get encoder features as inputs
-        field_inputs = input_fn(samples, encoder_states)
-        
-        # forward implicit fields
-        field_outputs = field_fn(field_inputs, outputs=output_types)
-        outputs = {'sample_mask': sample_mask}
+        field_inputs = input_fn(masked_samples, encoder_states)
         
         def masked_scatter(mask, x):
             B, K = mask.size()
@@ -112,23 +120,57 @@ class VolumeRenderer(Renderer):
                 return x.new_zeros(B, K).masked_scatter(mask, x)
             return x.new_zeros(B, K, x.size(-1)).masked_scatter(
                 mask.unsqueeze(-1).expand(B, K, x.size(-1)), x)
-        
-        # post processing
-        if 'sigma' in field_outputs:
-            sigma, sampled_dists= field_outputs['sigma'], field_inputs['dists']
+
+        def post_process_sigma(sigma, sampled_dists):
             noise = 0 if not self.discrete_reg and (not self.training) else torch.zeros_like(sigma).normal_()  
             free_energy = torch.relu(noise + sigma) * sampled_dists   
             free_energy = free_energy * 7.0  # ? [debug] 
             # (optional) free_energy = (F.elu(sigma - 3, alpha=1) + 1) * dists
             # (optional) free_energy = torch.abs(sigma) * sampled_dists  ## ??
-            outputs['free_energy'] = masked_scatter(sample_mask, free_energy)
+            free_energy = masked_scatter(sample_mask, free_energy)
+            return free_energy
+
+        # forward implicit fields
+        outputs = {'sample_mask': sample_mask}
+        if self.acum_latent and 'sigma' in output_types and 'texture' in output_types:
+            # Calculate per ray densities
+            output_types = output_types.copy() # Create a copy so we don't modify input
+            output_types.remove('texture')
+            field_outputs = field_fn(field_inputs, outputs=output_types) # TODO: Investigate which other outputs should be in the first pass
+            sigma, sampled_dists = field_outputs['sigma'], field_inputs['dists']
+            free_energy = post_process_sigma(sigma, sampled_dists)
+            probs = self.calc_hit_probs(sampled_depth, free_energy)
+
+            # Calculate density weighted average embedding along each ray
+            probs = probs.unsqueeze(-1)
+            emb = masked_scatter(sample_mask, field_inputs['emb'])
+            emb = (probs * emb).sum(1)
+
+            # Decode per ray embedding to texture
+            ray_dir = samples['sampled_point_ray_direction'][:,0]
+            new_field_inputs = {'emb': emb, 'ray': ray_dir} # TODO: Include rest of inputs?
+            new_field_outputs = field_fn(new_field_inputs, outputs='texture') # TODO: Investigate which outputs should be in the second pass
+            field_outputs.update({
+                'feat_n2': new_field_outputs['feat_n2'].unsqueeze(1),
+                'texture': new_field_outputs['texture'].unsqueeze(1)
+            })
+            outputs['texture'] = new_field_outputs['texture'].unsqueeze(1)
+            outputs['feat_n2'] = new_field_outputs['feat_n2'].unsqueeze(1)
+            
+        else:
+            field_outputs = field_fn(field_inputs, outputs=output_types)
+        
+        # post processing
+        if 'sigma' in field_outputs:
+            sigma, sampled_dists = field_outputs['sigma'], field_inputs['dists']
+            outputs['free_energy'] = post_process_sigma(sigma, sampled_dists)
         if 'sdf' in field_outputs:
             outputs['sdf'] = masked_scatter(sample_mask, field_outputs['sdf'])
-        if 'texture' in field_outputs:
+        if 'texture' in field_outputs and not self.acum_latent:
             outputs['texture'] = masked_scatter(sample_mask, field_outputs['texture'])
         if 'normal' in field_outputs:
             outputs['normal'] = masked_scatter(sample_mask, field_outputs['normal'])
-        if 'feat_n2' in field_outputs:
+        if 'feat_n2' in field_outputs  and not self.acum_latent:
             outputs['feat_n2'] = masked_scatter(sample_mask, field_outputs['feat_n2'])
         return outputs, sample_mask.sum()
 
@@ -151,6 +193,7 @@ class VolumeRenderer(Renderer):
             
         hits = sampled_idx.ne(-1).long()
         outputs = defaultdict(lambda: [])
+        chunk_info = defaultdict(lambda: [])
         size_so_far, start_step = 0, 0
         accumulated_free_energy = 0
         accumulated_evaluations = 0
@@ -182,6 +225,8 @@ class VolumeRenderer(Renderer):
                             sampled_depth[:, start_step: i].size(1),
                             *outputs[key][-1].size()[2:] 
                         )]
+                chunk_info['chunk_start'] += [start_step]
+                chunk_info['chunk_size']  += [i]
                 start_step, size_so_far = i, 0
             
             if (i < hits.size(1)):
@@ -192,13 +237,11 @@ class VolumeRenderer(Renderer):
         
         if 'free_energy' in outputs:
             free_energy = outputs['free_energy']
-            shifted_free_energy = torch.cat([free_energy.new_zeros(sampled_depth.size(0), 1), free_energy[:, :-1]], dim=-1)  # shift one step
-            a = 1 - torch.exp(-free_energy.float())                             # probability of it is not empty here
-            b = torch.exp(-torch.cumsum(shifted_free_energy.float(), dim=-1))   # probability of everything is empty up to now
-            probs = (a * b).type_as(free_energy)                                # probability of the ray hits something here
+            probs = self.calc_hit_probs(sampled_depth, free_energy)
         else:
             probs = outputs['sample_mask'].type_as(sampled_depth) / sampled_depth.size(-1)  # assuming a uniform distribution
 
+        # TODO: Account for global weights when doing latent space accumulation
         if global_weights is not None:
             probs = probs * global_weights
 
@@ -214,9 +257,6 @@ class VolumeRenderer(Renderer):
         if original_depth is not None:
             results['z'] = (original_depth * probs).sum(-1)
 
-        if 'texture' in outputs:
-            results['colors'] = (outputs['texture'] * probs.unsqueeze(-1)).sum(-2)
-        
         if 'normal' in outputs:
             results['normal'] = (outputs['normal'] * probs.unsqueeze(-1)).sum(-2)
             if not self.trace_normal:
@@ -225,9 +265,27 @@ class VolumeRenderer(Renderer):
                 results['eikonal-term'] = torch.log((outputs['normal'] ** 2).sum(-1) + 1e-6)
             results['eikonal-term'] = results['eikonal-term'][sampled_idx.ne(-1)]
 
+        # If we are pre-accumulating in latent space before decoding color, 
+        # then probabilities need to be accumulated for each decoded ray chunk
+        if  (('texture' in outputs and probs.size(-1) != outputs['texture'].size(-2)) or
+             ('feat_n2' in outputs and probs.size(-1) != outputs['feat_n2'].size(-1))):
+            _probs = []
+            sample_mask = []
+            for i, chunk_start in enumerate(chunk_info['chunk_start']):
+                chunk_end = chunk_start + chunk_info['chunk_size'][i]
+                _probs.append(probs[:, chunk_start:chunk_end].sum(-1, keepdim=True))
+                sample_mask.append(sampled_idx[:, chunk_start:chunk_end].ne(-1).any(-1, keepdim=True))
+            probs = torch.cat(_probs, -1)
+            sample_mask = torch.cat(sample_mask, -1)
+        else:
+            sample_mask = sampled_idx.ne(-1)
+
+        if 'texture' in outputs:
+            results['colors'] = (outputs['texture'] * probs.unsqueeze(-1)).sum(-2)
+
         if 'feat_n2' in outputs:
             results['feat_n2'] = (outputs['feat_n2'] * probs).sum(-1)
-            results['regz-term'] = outputs['feat_n2'][sampled_idx.ne(-1)]
+            results['regz-term'] = outputs['feat_n2'][sample_mask]
             
         return results
 
