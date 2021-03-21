@@ -56,7 +56,7 @@ class VolumeRenderer(Renderer):
         self.chunk_size = 1024 * getattr(args, "chunk_size", 64)
         self.valid_chunk_size = 1024 * getattr(args, "valid_chunk_size", self.chunk_size // 1024)
         self.discrete_reg = getattr(args, "discrete_regularization", False)
-        self.raymarching_tolerance = getattr(args, "raymarching_tolerance", 0.0)
+        # self.raymarching_tolerance = getattr(args, "raymarching_tolerance", 0.0)
         self.trace_normal = getattr(args, "trace_normal", False)
         self.acum_latent = getattr(args, "acum_latent", False)
 
@@ -71,7 +71,7 @@ class VolumeRenderer(Renderer):
                             help='set chunks to go through the network (~K forward passes). trade time for memory. ')
         parser.add_argument('--valid-chunk-size', type=int, metavar='D', 
                             help='chunk size used when no training. In default the same as chunk-size.')
-        parser.add_argument('--raymarching-tolerance', type=float, default=0)
+        # parser.add_argument('--raymarching-tolerance', type=float, default=0)
 
         parser.add_argument('--trace-normal', action='store_true')
 
@@ -185,54 +185,43 @@ class VolumeRenderer(Renderer):
         sampled_idx = samples['sampled_point_voxel_idx'].long()
         original_depth = samples.get('original_point_depth', None)
 
-        tolerance = self.raymarching_tolerance
+        # tolerance = self.raymarching_tolerance
         chunk_size = self.chunk_size if self.training else self.valid_chunk_size
-        early_stop = None
-        if tolerance > 0:
-            tolerance = -math.log(tolerance)
+        # early_stop = None
+        # if tolerance > 0:
+        #     tolerance = -math.log(tolerance)
             
         hits = sampled_idx.ne(-1).long()
         outputs = defaultdict(lambda: [])
-        chunk_info = defaultdict(lambda: [])
-        size_so_far, start_step = 0, 0
-        accumulated_free_energy = 0
+        # accumulated_free_energy = 0
         accumulated_evaluations = 0
-        for i in range(hits.size(1) + 1):
-            if ((i == hits.size(1)) or (size_so_far + hits[:, i].sum() > chunk_size)) and (i > start_step):
-                _outputs, _evals = self.forward_once(
-                        input_fn, field_fn, 
-                        ray_start, ray_dir, 
-                        {name: s[:, start_step: i] 
-                            for name, s in samples.items()},
-                        encoder_states, 
-                        early_stop=early_stop,
-                        output_types=output_types)
-                if _outputs is not None:
-                    accumulated_evaluations += _evals
+        num_fwd_passes = math.ceil(hits.size(0) * hits.size(1) / chunk_size)
+        rays_per_chunk = math.ceil(hits.size(0) / num_fwd_passes)
+        num_fwd_passes = math.ceil(hits.size(0) / rays_per_chunk) # Needed in case ceiling operation on rays_per_chunk causes less forward passes to be needed
+        for i in range(num_fwd_passes):
+            start_step = i * rays_per_chunk
+            end_step = start_step + rays_per_chunk
+            _outputs, _evals = self.forward_once(
+                    input_fn, field_fn, 
+                    ray_start[start_step:end_step], ray_dir[start_step:end_step], 
+                    {name: s[start_step:end_step] 
+                        for name, s in samples.items()},
+                    encoder_states, 
+                    # early_stop=early_stop[start_step:end_step] if early_stop else None,
+                    output_types=output_types)
+            if _outputs is not None:
+                accumulated_evaluations += _evals
 
-                    if 'free_energy' in _outputs:
-                        accumulated_free_energy += _outputs['free_energy'].sum(1)
-                        if tolerance > 0:
-                            early_stop = accumulated_free_energy > tolerance
-                            hits[early_stop] *= 0
-                    
-                    for key in _outputs:
-                        outputs[key] += [_outputs[key]]
-                else:
-                    for key in outputs:
-                        outputs[key] += [outputs[key][-1].new_zeros(
-                            outputs[key][-1].size(0),
-                            sampled_depth[:, start_step: i].size(1),
-                            *outputs[key][-1].size()[2:] 
-                        )]
-                chunk_info['chunk_start'] += [start_step]
-                chunk_info['chunk_size']  += [i]
-                start_step, size_so_far = i, 0
-            
-            if (i < hits.size(1)):
-                size_so_far += hits[:, i].sum()
+                # if 'free_energy' in _outputs:
+                #     accumulated_free_energy += _outputs['free_energy'].sum(1)
+                #     if tolerance > 0:
+                #         early_stop = accumulated_free_energy > tolerance
+                #         hits[early_stop] *= 0
+                
+                for key in _outputs:
+                    outputs[key] += [_outputs[key]]
 
-        outputs = {key: torch.cat(outputs[key], 1) for key in outputs}
+        outputs = {key: torch.cat(outputs[key], 0) for key in outputs}
         results = {}
         
         if 'free_energy' in outputs:
@@ -265,27 +254,23 @@ class VolumeRenderer(Renderer):
                 results['eikonal-term'] = torch.log((outputs['normal'] ** 2).sum(-1) + 1e-6)
             results['eikonal-term'] = results['eikonal-term'][sampled_idx.ne(-1)]
 
-        # If we are pre-accumulating in latent space before decoding color, 
-        # then probabilities need to be accumulated for each decoded ray chunk
-        if  (('texture' in outputs and probs.size(-1) != outputs['texture'].size(-2)) or
-             ('feat_n2' in outputs and probs.size(-1) != outputs['feat_n2'].size(-1))):
-            _probs = []
-            sample_mask = []
-            for i, chunk_start in enumerate(chunk_info['chunk_start']):
-                chunk_end = chunk_start + chunk_info['chunk_size'][i]
-                _probs.append(probs[:, chunk_start:chunk_end].sum(-1, keepdim=True))
-                sample_mask.append(sampled_idx[:, chunk_start:chunk_end].ne(-1).any(-1, keepdim=True))
-            probs = torch.cat(_probs, -1)
-            sample_mask = torch.cat(sample_mask, -1)
-        else:
-            sample_mask = sampled_idx.ne(-1)
-
         if 'texture' in outputs:
-            results['colors'] = (outputs['texture'] * probs.unsqueeze(-1)).sum(-2)
+            if outputs['texture'].size(-2) == probs.size(-1):
+                # Regular accumulation
+                results['colors'] = (outputs['texture'] * probs.unsqueeze(-1)).sum(-2)
+            else:
+                # Latent space accumulation (pre-accumulated before decoding)
+                results['colors'] = outputs['texture'].squeeze()
 
         if 'feat_n2' in outputs:
-            results['feat_n2'] = (outputs['feat_n2'] * probs).sum(-1)
-            results['regz-term'] = outputs['feat_n2'][sample_mask]
+            if outputs['texture'].size(-2) == probs.size(-1):
+                # Regular accumulation
+                results['feat_n2'] = (outputs['feat_n2'] * probs).sum(-1)
+                results['regz-term'] = outputs['feat_n2'][sampled_idx.ne(-1)]
+            else:
+                # Latent space accumulation (pre-accumulated before decoding)
+                results['feat_n2'] = outputs['feat_n2'].squeeze()
+                results['regz-term'] = outputs['feat_n2'].squeeze()
             
         return results
 
